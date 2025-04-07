@@ -12,6 +12,7 @@ from torchvision.models import vgg19, efficientnet_b0, EfficientNet_B0_Weights
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from PIL import Image, ImageFile
 from tqdm import tqdm
+import math
 import cv2
 import datetime
 import time
@@ -190,14 +191,33 @@ def compute_gradient_penalty(D, real, fake):
     return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
 
+
+
+def compute_ag(img):
+    img_np = img.squeeze().cpu().numpy() * 0.5 + 0.5
+    img_np = (img_np * 255).astype(np.uint8)
+    grad_x = cv2.Sobel(img_np, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(img_np, cv2.CV_64F, 0, 1, ksize=3)
+    grad = np.sqrt((grad_x ** 2 + grad_y ** 2) / 2)
+    return grad.mean()
+
+def compute_ie(img):
+    img_np = img.squeeze().cpu().numpy() * 0.5 + 0.5
+    img_np = (img_np * 255).astype(np.uint8)
+    hist, _ = np.histogram(img_np, bins=256, range=(0, 255), density=True)
+    hist = hist[hist > 0]
+    return -np.sum(hist * np.log2(hist))
+
 def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     generator = EnhancedGenerator().to(device)
     discriminator = EnhancedDiscriminator().to(device)
     vgg_loss = VGGLoss().to(device)
     eff_loss = EfficientNetLoss().to(device)
+
     optimizer_G = optim.AdamW(generator.parameters(), lr=config['lr'], betas=(config['beta1'], 0.999))
     optimizer_D = optim.AdamW(discriminator.parameters(), lr=config['lr'] * 0.5, betas=(config['beta1'], 0.999))
+
     scheduler_G = ReduceLROnPlateau(optimizer_G, 'min', factor=0.5, patience=5)
     scheduler_D = ReduceLROnPlateau(optimizer_D, 'min', factor=0.5, patience=5)
 
@@ -206,12 +226,17 @@ def train_model():
                               num_workers=config['num_workers'], pin_memory=True,
                               prefetch_factor=config['prefetch_factor'])
 
+    test_loader = DataLoader(EnhancedImageDataset(config['data_path'], 'test'),
+                             batch_size=1, shuffle=False, num_workers=0)
+
     for epoch in range(config['epochs']):
         generator.train()
         discriminator.train()
         g_losses, d_losses = [], []
-        for real_imgs, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}"):
+
+        for real_imgs, _ in tqdm(train_loader, desc=f"[Epoch {epoch+1}/{config['epochs']}]"):
             real_imgs = real_imgs.to(device)
+
             optimizer_D.zero_grad()
             fake_imgs = generator(real_imgs)
             real_pred = discriminator(real_imgs)
@@ -226,6 +251,7 @@ def train_model():
             mse = nn.MSELoss()(gen_imgs, real_imgs)
             vgg = vgg_loss(gen_imgs, real_imgs)
             eff = eff_loss(gen_imgs, real_imgs)
+
             g_total = (config['lambda_adv'] * adv_loss + config['lambda_mse'] * mse +
                        config['lambda_vgg'] * vgg + config['lambda_eff'] * eff)
             g_total.backward()
@@ -237,9 +263,34 @@ def train_model():
         scheduler_G.step(np.mean(g_losses))
         scheduler_D.step(np.mean(d_losses))
 
+        print(f"Epoch [{epoch+1}] | G_loss: {np.mean(g_losses):.4f} | D_loss: {np.mean(d_losses):.4f}")
+
         if (epoch + 1) % config['save_interval'] == 0:
             torch.save(generator.state_dict(), os.path.join(config['model_dir'], f'gen_epoch_{epoch+1}.pth'))
 
+    generator.eval()
+    psnr_total, ssim_total, ag_total, ie_total, count = 0.0, 0.0, 0.0, 0.0, 0
+
+    with torch.no_grad():
+        for real_imgs, _ in tqdm(test_loader, desc="Testing"):
+            real_imgs = real_imgs.to(device)
+            gen_imgs = generator(real_imgs)
+
+            real_np = real_imgs.cpu().squeeze().numpy() * 0.5 + 0.5
+            gen_np = gen_imgs.cpu().squeeze().numpy() * 0.5 + 0.5
+
+            psnr = peak_signal_noise_ratio(real_np, gen_np, data_range=1)
+            ssim = structural_similarity(real_np, gen_np, data_range=1)
+            ag = compute_ag(gen_imgs)
+            ie = compute_ie(gen_imgs)
+
+            psnr_total += psnr
+            ssim_total += ssim
+            ag_total += ag
+            ie_total += ie
+            count += 1
+
+    print(f"[Test Results] PSNR: {psnr_total / count:.2f}, SSIM: {ssim_total / count:.4f}, AG: {ag_total / count:.4f}, IE: {ie_total / count:.4f}")
 
 if __name__ == '__main__':
     train_model()
